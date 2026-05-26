@@ -1,0 +1,548 @@
+SMART CAR PARKING SYSTEM — ESP32   
+   PIN CONNECTIONS:
+   Servo (Gate)          GPIO 18
+   IR Entry Sensor       GPIO 13   (OUTSIDE gate)
+   IR Exit  Sensor       GPIO 34   (INSIDE  gate)
+
+   Ultrasonic Slot 1     TRIG=26   ECHO=25
+   Ultrasonic Slot 2     TRIG=27   ECHO=14
+
+   Traffic Light Slot 1  R=4   Y=2   G=15
+   Traffic Light Slot 2  R=5   Y=19  G=23
+   Traffic Light GATE    R=32  G=33  (RED+GREEN only)
+
+   Buzzer                GPIO 12
+   LCD I2C               SDA=21  SCL=22
+ ╠══════════════════════════════════════════════════════════╣
+   GATE LOGIC (SIMPLE):
+   Entry IR (GPIO13) detects car → Gate OPENS
+   Exit  IR (GPIO34) detects car → Gate CLOSES
+   Manual open/close via webpage buttons also available
+
+   UNAUTHORIZED:
+     Car parks in booked slot without Confirm Arrival
+     → LCD shows UNAUTHORIZED + buzzer alarm
+     → Booking STAYS (not deleted)
+     → LCD returns to normal after 5 seconds
+
+   WEBPAGE: Manual Open/Close gate buttons included
+
+   BUZZER: ONLY for unauthorized parking
+
+   BOOKING:
+     Book via webpage (Name + Phone + Email)
+     Confirm Arrival button
+     Expires after 10 minutes
+ ╠══════════════════════════════════════════════════════════╣
+   LIBRARIES (Arduino Library Manager):
+   ESP32Servo   LiquidCrystal_I2C   WiFi   WebServer
+ ╚══════════════════════════════════════════════════════════╝
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ── WiFi ──────────────────────────────────────
+const char* ssid     = "";
+const char* password = "";
+
+// ── Pins ──────────────────────────────────────
+#define SERVO_PIN  18
+#define IR_ENTRY   13   // OUTSIDE gate
+#define IR_EXIT    34   // INSIDE  gate
+
+#define TRIG1  26
+#define ECHO1  25
+#define TRIG2  27
+#define ECHO2  14
+
+// Slot traffic lights
+#define TL1_R  4
+#define TL1_Y  2
+#define TL1_G  15
+#define TL2_R  5
+#define TL2_Y  19
+#define TL2_G  23
+
+// Gate traffic light — RED + GREEN only
+#define TLG_R  32
+#define TLG_G  33
+
+#define BUZZER 12
+
+// ── Constants ─────────────────────────────────
+#define TOTAL_SLOTS      2
+#define OCCUPIED_DIST    10         // cm ultrasonic threshold
+#define GATE_OPEN_POS    90         // servo open angle
+#define GATE_CLOSE_POS   0          // servo close angle
+#define BOOKING_EXPIRY   600000UL   // 10 minutes
+#define UNAUTH_LCD_TIME  5000UL     // show UNAUTHORIZED on LCD for 5 sec
+
+// ── Objects ───────────────────────────────────
+Servo gateServo;
+LiquidCrystal_I2C lcd(0x27, 16, 2); // change to 0x3F if LCD blank
+WebServer server(80);
+
+// ── Slot State ────────────────────────────────
+bool slot1Occupied  = false;
+bool slot2Occupied  = false;
+bool slot1Unauth    = false;
+bool slot2Unauth    = false;
+int  availableSlots = TOTAL_SLOTS;
+bool gateOpen       = false;
+
+unsigned long slot1CheckIn   = 0;
+unsigned long slot1CheckOut  = 0;
+unsigned long slot2CheckIn   = 0;
+unsigned long slot2CheckOut  = 0;
+unsigned long unauthShowTime = 0;  // when unauthorized was detected
+
+// Gate direction tracking — "entry" or "manual"
+String gateOpenedBy = "";
+
+// ── Booking ───────────────────────────────────
+struct Booking {
+  bool   active    = false;
+  bool   confirmed = false;
+  String name      = "";
+  String phone     = "";
+  String email     = "";
+  unsigned long bookedAt = 0;
+};
+Booking booking1, booking2;
+
+// ═════════════════════════════════════════════
+//  HELPERS
+// ═════════════════════════════════════════════
+long getDistance(int trig, int echo) {
+  digitalWrite(trig, LOW);  delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long d = pulseIn(echo, HIGH, 30000);
+  return (d == 0) ? 999 : d * 0.034 / 2;
+}
+
+void setSlotTL(int slot, const char* st) {
+  int r = (slot==1) ? TL1_R : TL2_R;
+  int y = (slot==1) ? TL1_Y : TL2_Y;
+  int g = (slot==1) ? TL1_G : TL2_G;
+  digitalWrite(r,LOW); digitalWrite(y,LOW); digitalWrite(g,LOW);
+  if      (strcmp(st,"RED")   ==0) digitalWrite(r,HIGH);
+  else if (strcmp(st,"YELLOW")==0) digitalWrite(y,HIGH);
+  else if (strcmp(st,"GREEN") ==0) digitalWrite(g,HIGH);
+}
+
+void setGateTL(bool carDetected) {
+  digitalWrite(TLG_R, LOW);
+  digitalWrite(TLG_G, LOW);
+  if (carDetected) digitalWrite(TLG_G, HIGH);
+  else             digitalWrite(TLG_R, HIGH);
+}
+
+void openGate(String reason) {
+  gateServo.write(GATE_OPEN_POS);
+  gateOpen     = true;
+  gateOpenedBy = reason;
+  Serial.println(">> Gate OPENED by: " + reason);
+}
+
+void closeGate() {
+  gateServo.write(GATE_CLOSE_POS);
+  gateOpen     = false;
+  gateOpenedBy = "";
+  Serial.println(">> Gate CLOSED");
+}
+
+void unauthorizedAlarm() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(BUZZER, HIGH); delay(800);
+    digitalWrite(BUZZER, LOW);  delay(200);
+  }
+}
+
+void clearBooking(int slot) {
+  if (slot==1) booking1 = {false,false,"","","",0};
+  else         booking2 = {false,false,"","","",0};
+}
+
+String fmtDuration(unsigned long secs) {
+  if (secs == 0) return "--";
+  unsigned long h=secs/3600, m=(secs%3600)/60, s=secs%60;
+  String r="";
+  if(h>0) r+=String(h)+"h ";
+  if(m>0) r+=String(m)+"m ";
+  r+=String(s)+"s";
+  return r;
+}
+
+String fmtTime(unsigned long secs) {
+  if (secs == 0) return "--:--:--";
+  char buf[10];
+  sprintf(buf,"%02lu:%02lu:%02lu",(secs/3600)%24,(secs%3600)/60,secs%60);
+  return String(buf);
+}
+
+String urlDecode(String s) {
+  String out="";
+  for(int i=0;i<(int)s.length();i++){
+    if(s[i]=='+') out+=' ';
+    else if(s[i]=='%'&&i+2<(int)s.length()){
+      out+=(char)strtol(s.substring(i+1,i+3).c_str(),nullptr,16);
+      i+=2;
+    } else out+=s[i];
+  }
+  return out;
+}
+
+// ═════════════════════════════════════════════
+//  LCD UPDATE
+// ═════════════════════════════════════════════
+void updateLCD() {
+  lcd.clear();
+
+  // Show UNAUTHORIZED warning (stays for UNAUTH_LCD_TIME ms)
+  // Booking is NOT cleared — just shows warning temporarily
+  if ((slot1Unauth || slot2Unauth) &&
+      (millis() - unauthShowTime < UNAUTH_LCD_TIME)) {
+    lcd.setCursor(0,0); lcd.print("!!UNAUTHORIZED!!");
+    lcd.setCursor(0,1);
+    if (slot1Unauth && slot2Unauth) lcd.print("Slot 1 & Slot 2!");
+    else if (slot1Unauth)           lcd.print("Slot 1 !!!");
+    else                            lcd.print("Slot 2 !!!");
+    return;
+  }
+
+  // Normal display
+  lcd.setCursor(0,0);
+  lcd.print("Free:");
+  lcd.print(availableSlots);
+  lcd.print("/2 G:");
+  lcd.print(gateOpen ? "OPEN" : "SHUT");
+
+  lcd.setCursor(0,1);
+  String s1 = slot1Occupied ? "OCC" :
+              (booking1.active ? (booking1.confirmed ? "CNF" : "BKD") : "FRE");
+  String s2 = slot2Occupied ? "OCC" :
+              (booking2.active ? (booking2.confirmed ? "CNF" : "BKD") : "FRE");
+  lcd.print("S1:"); lcd.print(s1);
+  lcd.print(" S2:"); lcd.print(s2);
+}
+
+// ═════════════════════════════════════════════
+//  /status → JSON
+// ═════════════════════════════════════════════
+void handleStatus() {
+  unsigned long nowMs  = millis();
+  unsigned long nowSec = nowMs / 1000;
+
+  long rem1 = booking1.active ? (long)(BOOKING_EXPIRY-(nowMs-booking1.bookedAt))/1000 : 0;
+  long rem2 = booking2.active ? (long)(BOOKING_EXPIRY-(nowMs-booking2.bookedAt))/1000 : 0;
+  if(rem1<0)rem1=0; if(rem2<0)rem2=0;
+
+  unsigned long dur1 = (slot1Occupied&&slot1CheckIn>0) ? (nowSec-slot1CheckIn) : 0;
+  unsigned long dur2 = (slot2Occupied&&slot2CheckIn>0) ? (nowSec-slot2CheckIn) : 0;
+
+  String j="{";
+  j+="\"slot1_occupied\":"  +String(slot1Occupied?"true":"false")+",";
+  j+="\"slot2_occupied\":"  +String(slot2Occupied?"true":"false")+",";
+  j+="\"slot1_booked\":"    +String(booking1.active?"true":"false")+",";
+  j+="\"slot2_booked\":"    +String(booking2.active?"true":"false")+",";
+  j+="\"slot1_confirmed\":" +String(booking1.confirmed?"true":"false")+",";
+  j+="\"slot2_confirmed\":" +String(booking2.confirmed?"true":"false")+",";
+  j+="\"slot1_unauth\":"    +String(slot1Unauth?"true":"false")+",";
+  j+="\"slot2_unauth\":"    +String(slot2Unauth?"true":"false")+",";
+  j+="\"slot1_name\":\""    +booking1.name+"\",";
+  j+="\"slot1_phone\":\""   +booking1.phone+"\",";
+  j+="\"slot1_email\":\""   +booking1.email+"\",";
+  j+="\"slot2_name\":\""    +booking2.name+"\",";
+  j+="\"slot2_phone\":\""   +booking2.phone+"\",";
+  j+="\"slot2_email\":\""   +booking2.email+"\",";
+  j+="\"slot1_timeLeft\":"  +String(rem1)+",";
+  j+="\"slot2_timeLeft\":"  +String(rem2)+",";
+  j+="\"slot1_checkIn\":\""  +fmtTime(slot1CheckIn)+"\",";
+  j+="\"slot1_checkOut\":\"" +fmtTime(slot1CheckOut)+"\",";
+  j+="\"slot1_duration\":\"" +fmtDuration(dur1)+"\",";
+  j+="\"slot2_checkIn\":\""  +fmtTime(slot2CheckIn)+"\",";
+  j+="\"slot2_checkOut\":\"" +fmtTime(slot2CheckOut)+"\",";
+  j+="\"slot2_duration\":\"" +fmtDuration(dur2)+"\",";
+  j+="\"available\":"        +String(availableSlots)+",";
+  j+="\"gate\":\""           +String(gateOpen?"open":"closed")+"\",";
+  j+="\"carAtEntry\":"       +String((digitalRead(IR_ENTRY)==LOW)?"true":"false");
+  j+="}";
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  server.send(200,"application/json",j);
+}
+
+// ═════════════════════════════════════════════
+//  /book
+// ═════════════════════════════════════════════
+void handleBook() {
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  if(!server.hasArg("slot")||!server.hasArg("name")||
+     !server.hasArg("phone")||!server.hasArg("email")){
+    server.send(400,"application/json","{\"success\":false,\"msg\":\"Missing fields\"}");
+    return;
+  }
+  int    slot  = server.arg("slot").toInt();
+  String name  = urlDecode(server.arg("name"));
+  String phone = urlDecode(server.arg("phone"));
+  String email = urlDecode(server.arg("email"));
+
+  if(slot<1||slot>2){
+    server.send(400,"application/json","{\"success\":false,\"msg\":\"Bad slot\"}");
+    return;
+  }
+  bool     occ = (slot==1)?slot1Occupied:slot2Occupied;
+  Booking* bk  = (slot==1)?&booking1:&booking2;
+
+  if(occ)       { server.send(200,"application/json","{\"success\":false,\"msg\":\"Slot already occupied!\"}"); return; }
+  if(bk->active){ server.send(200,"application/json","{\"success\":false,\"msg\":\"Slot already booked!\"}");   return; }
+
+  bk->active    = true;
+  bk->confirmed = false;
+  bk->name      = name;
+  bk->phone     = phone;
+  bk->email     = email;
+  bk->bookedAt  = millis();
+  updateLCD();
+  Serial.println("Slot "+String(slot)+" BOOKED by "+name);
+  server.send(200,"application/json","{\"success\":true,\"msg\":\"Slot booked successfully!\"}");
+}
+
+// ═════════════════════════════════════════════
+//  /confirm
+// ═════════════════════════════════════════════
+void handleConfirm() {
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  if(!server.hasArg("slot")){
+    server.send(400,"application/json","{\"success\":false,\"msg\":\"Missing slot\"}");
+    return;
+  }
+  int slot = server.arg("slot").toInt();
+  Booking* bk = (slot==1)?&booking1:&booking2;
+  if(!bk->active){
+    server.send(200,"application/json","{\"success\":false,\"msg\":\"No active booking\"}");
+    return;
+  }
+  bk->confirmed = true;
+  updateLCD();
+  Serial.println("Slot "+String(slot)+" CONFIRMED by "+bk->name);
+  server.send(200,"application/json","{\"success\":true,\"msg\":\"Arrival confirmed!\"}");
+}
+
+// ═════════════════════════════════════════════
+//  /cancel
+// ═════════════════════════════════════════════
+void handleCancel() {
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  if(!server.hasArg("slot")){
+    server.send(400,"application/json","{\"success\":false,\"msg\":\"Missing slot\"}");
+    return;
+  }
+  int slot = server.arg("slot").toInt();
+  Booking* bk = (slot==1)?&booking1:&booking2;
+  if(bk->active){
+    clearBooking(slot);
+    updateLCD();
+    server.send(200,"application/json","{\"success\":true,\"msg\":\"Booking cancelled\"}");
+  } else {
+    server.send(200,"application/json","{\"success\":false,\"msg\":\"No booking found\"}");
+  }
+}
+
+// ═════════════════════════════════════════════
+//  /gate?action=open  OR  /gate?action=close
+//  Manual gate control from webpage
+// ═════════════════════════════════════════════
+void handleGate() {
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  if(!server.hasArg("action")){
+    server.send(400,"application/json","{\"success\":false,\"msg\":\"Missing action\"}");
+    return;
+  }
+  String action = server.arg("action");
+  if(action=="open"){
+    openGate("manual");
+    updateLCD();
+    server.send(200,"application/json","{\"success\":true,\"msg\":\"Gate opened manually\"}");
+  } else if(action=="close"){
+    closeGate();
+    updateLCD();
+    server.send(200,"application/json","{\"success\":true,\"msg\":\"Gate closed manually\"}");
+  } else {
+    server.send(400,"application/json","{\"success\":false,\"msg\":\"Unknown action\"}");
+  }
+}
+
+// ═════════════════════════════════════════════
+//  SETUP
+// ═════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(IR_ENTRY,INPUT); pinMode(IR_EXIT,INPUT);
+  pinMode(TRIG1,OUTPUT); pinMode(ECHO1,INPUT);
+  pinMode(TRIG2,OUTPUT); pinMode(ECHO2,INPUT);
+  pinMode(TL1_R,OUTPUT); pinMode(TL1_Y,OUTPUT); pinMode(TL1_G,OUTPUT);
+  pinMode(TL2_R,OUTPUT); pinMode(TL2_Y,OUTPUT); pinMode(TL2_G,OUTPUT);
+  pinMode(TLG_R,OUTPUT); pinMode(TLG_G,OUTPUT);
+  pinMode(BUZZER,OUTPUT);
+
+  gateServo.attach(SERVO_PIN);
+  closeGate();
+
+  setSlotTL(1,"GREEN"); setSlotTL(2,"GREEN");
+  setGateTL(false);
+
+  Wire.begin(21,22);
+  lcd.init(); lcd.backlight();
+  lcd.setCursor(0,0); lcd.print("Smart Parking...");
+  lcd.setCursor(0,1); lcd.print("Connecting WiFi ");
+
+  Serial.print("Connecting to WiFi");
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  WiFi.begin(ssid,password);
+  while(WiFi.status()!=WL_CONNECTED){ delay(500); Serial.print("."); }
+
+  Serial.println("\n=============================");
+  Serial.println("WiFi Connected!");
+  Serial.println("IP Address : " + WiFi.localIP().toString());
+  Serial.println("Open in HTML: " + WiFi.localIP().toString());
+  Serial.println("=============================");
+
+  lcd.clear();
+  lcd.setCursor(0,0); lcd.print("WiFi OK! IP:");
+  lcd.setCursor(0,1); lcd.print(WiFi.localIP());
+  delay(4000);
+
+  server.on("/"       , [](){ server.sendHeader("Access-Control-Allow-Origin","*"); server.send(200,"text/plain","ESP32 Smart Parking OK"); });
+  server.on("/status" , handleStatus);
+  server.on("/book"   , handleBook);
+  server.on("/confirm", handleConfirm);
+  server.on("/cancel" , handleCancel);
+  server.on("/gate"   , handleGate);
+  server.begin();
+
+  updateLCD();
+  Serial.println("System Ready!");
+}
+
+// ═════════════════════════════════════════════
+//  LOOP
+// ═════════════════════════════════════════════
+void loop() {
+  server.handleClient();
+
+  unsigned long nowMs  = millis();
+  unsigned long nowSec = nowMs / 1000;
+
+  // ── Read ultrasonic ──────────────────────────
+  long d1 = getDistance(TRIG1,ECHO1);
+  long d2 = getDistance(TRIG2,ECHO2);
+
+  bool prev1 = slot1Occupied;
+  bool prev2 = slot2Occupied;
+  slot1Occupied = (d1 < OCCUPIED_DIST);
+  slot2Occupied = (d2 < OCCUPIED_DIST);
+  availableSlots = TOTAL_SLOTS-(slot1Occupied?1:0)-(slot2Occupied?1:0);
+
+  // ── Check-in / Check-out ────────────────────
+  if(!prev1 && slot1Occupied){
+    slot1CheckIn=nowSec; slot1CheckOut=0;
+    Serial.println("Slot1 CHECK-IN "+fmtTime(slot1CheckIn));
+  }
+  if(prev1 && !slot1Occupied){
+    slot1CheckOut=nowSec;
+    slot1Unauth=false;
+    // DO NOT clear booking here — user may re-park
+    Serial.println("Slot1 CHECK-OUT "+fmtTime(slot1CheckOut));
+  }
+  if(!prev2 && slot2Occupied){
+    slot2CheckIn=nowSec; slot2CheckOut=0;
+    Serial.println("Slot2 CHECK-IN "+fmtTime(slot2CheckIn));
+  }
+  if(prev2 && !slot2Occupied){
+    slot2CheckOut=nowSec;
+    slot2Unauth=false;
+    Serial.println("Slot2 CHECK-OUT "+fmtTime(slot2CheckOut));
+  }
+
+  // ── Unauthorized detection ───────────────────
+  // Car parks in booked slot WITHOUT confirming arrival
+  if(!prev1 && slot1Occupied && booking1.active && !booking1.confirmed){
+    slot1Unauth      = true;
+    unauthShowTime   = nowMs;  // start LCD warning timer
+    Serial.println("!! UNAUTHORIZED Slot 1 !!");
+    updateLCD();               // show warning on LCD
+    unauthorizedAlarm();       // buzzer 3 beeps
+    // *** booking1 is NOT cleared — stays intact ***
+  }
+  if(!prev2 && slot2Occupied && booking2.active && !booking2.confirmed){
+    slot2Unauth      = true;
+    unauthShowTime   = nowMs;
+    Serial.println("!! UNAUTHORIZED Slot 2 !!");
+    updateLCD();
+    unauthorizedAlarm();
+    // *** booking2 is NOT cleared — stays intact ***
+  }
+
+  // ── Slot Traffic Lights ─────────────────────
+  if(slot1Occupied)        setSlotTL(1,"RED");
+  else if(booking1.active) setSlotTL(1,"YELLOW");
+  else                     setSlotTL(1,"GREEN");
+
+  if(slot2Occupied)        setSlotTL(2,"RED");
+  else if(booking2.active) setSlotTL(2,"YELLOW");
+  else                     setSlotTL(2,"GREEN");
+
+  // ── Read IR sensors ──────────────────────────
+  bool entryIR = (digitalRead(IR_ENTRY)==LOW); // car OUTSIDE gate
+  bool exitIR  = (digitalRead(IR_EXIT) ==LOW); // car INSIDE  gate (passed through)
+
+  // Gate TL — GREEN when car at entry, RED when no car
+  setGateTL(entryIR);
+
+  // ── GATE LOGIC (SIMPLE) ──────────────────────
+  // Entry IR detects car → Gate OPENS
+  // Exit  IR detects car → Gate CLOSES
+  // That's it — only for entering cars
+
+  if(!gateOpen && entryIR){
+    openGate("entry");
+    updateLCD();
+  }
+  if(gateOpen && exitIR && gateOpenedBy!="manual"){
+    delay(400); // let car fully pass
+    closeGate();
+    updateLCD();
+  }
+
+  // ── Booking expiry ───────────────────────────
+  if(booking1.active && (nowMs-booking1.bookedAt >= BOOKING_EXPIRY)){
+    clearBooking(1);
+    Serial.println("Slot1 booking EXPIRED");
+    updateLCD();
+  }
+  if(booking2.active && (nowMs-booking2.bookedAt >= BOOKING_EXPIRY)){
+    clearBooking(2);
+    Serial.println("Slot2 booking EXPIRED");
+    updateLCD();
+  }
+
+  // ── LCD refresh after unauthorized timer ends ─
+  // After 5 sec warning, go back to normal display
+  if((slot1Unauth||slot2Unauth) &&
+     (nowMs-unauthShowTime >= UNAUTH_LCD_TIME)){
+    updateLCD(); // back to normal slot info
+  }
+
+  // ── LCD update on slot state change ──────────
+  if(prev1!=slot1Occupied || prev2!=slot2Occupied) updateLCD();
+
+  delay(150);
+}
