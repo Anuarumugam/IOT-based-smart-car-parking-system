@@ -178,8 +178,12 @@ Smart-Car-Parking-System/
 
 ## 👨‍💻 Author
 
-**ANU A**  
-B.E. Electronics and Communication Engineering  
-Karpagam College of Engineering, Coimbatore  
-🔗 GitHub: github.com/Anuarumugam 
-🔗 LinkedIn: linkedin.com/in/anu-a-86523a350
+## 👨‍💻 Author
+
+**ANU A**
+B.E. Electronics and Communication Engineering
+Karpagam College of Engineering, Coimbatore
+
+🔗 GitHub: https://github.com/Anuarumugam
+🔗 LinkedIn: https://linkedin.com/in/anu-a-86523a350
+
