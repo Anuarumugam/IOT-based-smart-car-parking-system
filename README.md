@@ -27,7 +27,7 @@ A **fully automated IoT-based Smart Car Parking System** using ESP32 microcontro
 
 **Subject:** 23ECR407 - Embedded Systems and IoT  
 **College:** Karpagam College of Engineering, Coimbatore  
-**Year:** 2025
+**Year:** 2026
 
 ---
 
@@ -172,14 +172,14 @@ Smart-Car-Parking-System/
 ## 🏆 About This Project
 
 > Built as part of **23ECR407 - Embedded Systems and IoT** coursework  
-> Karpagam College of Engineering, Coimbatore — 2025
+> Karpagam College of Engineering, Coimbatore — 2026
 
 ---
 
 ## 👨‍💻 Author
 
-**Aswin Kumar V**  
+**ANU A**  
 B.E. Electronics and Communication Engineering  
 Karpagam College of Engineering, Coimbatore  
-🔗 GitHub: [Aswinkumar000](https://github.com/Aswinkumar000)  
-🔗 LinkedIn: [aswinkumar-v-462075331](https://linkedin.com/in/aswinkumar-v-462075331)
+🔗 GitHub:  
+🔗 LinkedIn: 
