@@ -181,5 +181,5 @@ Smart-Car-Parking-System/
 **ANU A**  
 B.E. Electronics and Communication Engineering  
 Karpagam College of Engineering, Coimbatore  
-🔗 GitHub:  
-🔗 LinkedIn: 
+🔗 GitHub: github.com/Anuarumugam 
+🔗 LinkedIn: linkedin.com/in/anu-a-86523a350
